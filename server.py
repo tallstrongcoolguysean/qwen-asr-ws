@@ -111,14 +111,12 @@ class StreamSession:
         self.running = True
 
     def init_state(self):
-        # NOTE: force_language is the documented param in qwen-asr's ASRStreamingState.
-        # If your installed version uses a different name, adjust here.
         self.state = model.init_streaming_state(
             unfixed_chunk_num=UNFIXED_CHUNK_NUM,
             unfixed_token_num=UNFIXED_TOKEN_NUM,
             chunk_size_sec=CHUNK_SIZE_SEC,
-            force_language=self.language,
         )
+        self.state.force_language = self.language
 
     def append(self, pcm: bytes):
         self.audio_buffer.extend(pcm)
