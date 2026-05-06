@@ -50,7 +50,8 @@ class StreamSession:
         # Streaming state
         self._chunk_id = 0
         self._raw_decoded = ""           # accumulated raw model output (with format markers)
-        self._last_emitted_text = ""
+        self._committed_text = ""    # text already emitted as FINAL
+        self._last_partial = ""
 
         # Build base prompt with language directive baked in
         self._prompt_raw = helper._build_text_prompt(
@@ -79,9 +80,6 @@ class StreamSession:
         self._audio_event.set()
 
     async def finalize(self):
-        """Process any remaining audio, then emit final transcription."""
-        # Flush any leftover audio (less than a chunk) by appending zero-padding to round up.
-        # Simpler: just process whatever's there as a final chunk.
         async with self._lock:
             if len(self._incoming) > 0:
                 self._accum = np.concatenate([self._accum, self._incoming])
@@ -90,9 +88,15 @@ class StreamSession:
                 if len(self._accum) >= int(0.3 * self.sample_rate):
                     await self._process_chunk_locked()
 
-        # Emit whatever the latest text is as the final
-        if self._last_emitted_text:
-            await self._emit_final(self._last_emitted_text)
+        # Anything still in the unstable tail becomes final at end-of-stream
+        try:
+            _, current_text = parse_asr_output(self._raw_decoded, user_language=self.force_language)
+            remaining = current_text[len(self._committed_text):]
+            if remaining.strip():
+                await self._emit_final(remaining)
+                self._committed_text = current_text
+        except Exception:
+            log.exception(f"[{self.sid}] finalize parse error")
 
     async def close(self):
         """Stop processing, abort in-flight vLLM request, await background task."""
@@ -195,18 +199,50 @@ class StreamSession:
             self._current_request_id = None
 
         # Update raw decoded (with prefix + new generation)
+        # Update raw decoded
         self._raw_decoded = prefix + gen_text
 
-        # Parse to clean lang/text
+        # Compute the "stable" portion: raw_decoded minus the last UNFIXED_TOKEN_NUM tokens
+        # (these will be regenerated next chunk, so they're not committed).
+        stable_raw = ""
+        if self._chunk_id >= UNFIXED_CHUNK_NUM:
+            ids = self.tokenizer.encode(self._raw_decoded)
+            k = UNFIXED_TOKEN_NUM
+            while True:
+                end_idx = max(0, len(ids) - k)
+                candidate = self.tokenizer.decode(ids[:end_idx]) if end_idx > 0 else ""
+                if "\ufffd" not in candidate:
+                    stable_raw = candidate
+                    break
+                if end_idx == 0:
+                    stable_raw = ""
+                    break
+                k += 1
+
+        # Parse both into clean text (stripping the "language X<asr_text>" markers)
         try:
-            _lang, text = parse_asr_output(self._raw_decoded, user_language=self.force_language)
+            _, current_text = parse_asr_output(self._raw_decoded, user_language=self.force_language)
+            if stable_raw:
+                _, stable_text = parse_asr_output(stable_raw, user_language=self.force_language)
+            else:
+                stable_text = ""
         except Exception:
             log.exception(f"[{self.sid}] parse error")
-            text = ""
+            current_text = ""
+            stable_text = ""
 
-        if text and text != self._last_emitted_text:
-            await self._emit_partial(text)
-            self._last_emitted_text = text
+        # Emit any newly-finalized text
+        if len(stable_text) > len(self._committed_text):
+            new_final = stable_text[len(self._committed_text):]
+            if new_final.strip():
+                await self._emit_final(new_final)
+            self._committed_text = stable_text
+
+        # Emit the unstable tail as partial
+        unstable = current_text[len(self._committed_text):]
+        if unstable.strip() and unstable != self._last_partial:
+            await self._emit_partial(unstable)
+            self._last_partial = unstable
 
         self._chunk_id += 1
 
