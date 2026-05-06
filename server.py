@@ -85,7 +85,6 @@ async def startup():
         max_num_seqs=MAX_NUM_SEQS,
         trust_remote_code=True,
         enforce_eager=False,
-        disable_log_requests=True,
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     log.info(f"AsyncLLMEngine ready (max_num_seqs={MAX_NUM_SEQS}, gpu_mem={GPU_MEMORY_UTILIZATION}).")
