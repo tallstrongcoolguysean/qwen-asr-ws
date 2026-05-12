@@ -1,0 +1,114 @@
+# =============================================================================
+# Cloud Build CI/CD for qwen-asr-ws
+# =============================================================================
+# Triggered on push to main. Builds the qwen image, pushes to AR with both
+# :SHORT_SHA and :latest tags, then rolls the prod GKE Deployment to the new
+# SHA-pinned image.
+#
+# The Pulumi RivaComponent Deployment for qwen-asr-ws uses
+# `ignoreChanges: ["spec.template.spec.containers[*].image"]` so this CI
+# deploy doesn't drift Pulumi state. Pulumi defines the Deployment shape;
+# this pipeline owns the image field at runtime.
+#
+# Trigger configuration (set up manually in GCP Console):
+#   - Project: sf-infra-7d23
+#   - Region:  us-central1
+#   - Source:  GitHub (2nd gen) -> GoStudyFetchGo/qwen-asr-ws
+#   - Branch:  ^main$
+#   - Config:  cloudbuild.yaml at repo root (this file)
+#
+# Service account IAM (in addition to default Cloud Build SA roles):
+#   - roles/artifactregistry.writer  on grpc-proxy AR repo (sf-infra-7d23)
+#   - roles/container.developer       on riva-cluster (sf-gke-9173)
+#   - roles/logging.logWriter         project-level
+#
+# Note: image is stored in the `grpc-proxy` AR repo under the image name
+# `qwen-asr-ws` (same repo as the proxy itself, different image). This avoids
+# creating a second AR repo for one image. To switch to a dedicated repo
+# later, change the image path in three places (build/push/set image) and
+# update the Pulumi grpcProxyRegistryUrl-derived qwenImageUrl wiring.
+#
+# Build time tip: the devel base image (pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel)
+# is ~5 GB. First Cloud Build run pulls it cold (~3-5 min). Subsequent runs
+# reuse the layer cache from Cloud Build's regional cache, ~30s.
+# =============================================================================
+
+steps:
+  # ---------------------------------------------------------------------------
+  # Build the image, tagged with both the commit SHA (immutable, used for
+  # deploy) and :latest (rolling pointer for human convenience).
+  # ---------------------------------------------------------------------------
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --tag=us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:$SHORT_SHA
+      - --tag=us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-sha
+    args:
+      - push
+      - us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:$SHORT_SHA
+    waitFor: [build]
+
+  - name: gcr.io/cloud-builders/docker
+    id: push-latest
+    args:
+      - push
+      - us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:latest
+    waitFor: [build]
+
+  # ---------------------------------------------------------------------------
+  # Roll the prod GKE Deployment to the SHA-pinned image. Pinning to SHA
+  # rather than :latest ensures the Deployment's pod template hash actually
+  # changes, which is what triggers a rollout. (set image with the same tag
+  # is a no-op even if the underlying image moved.)
+  #
+  # Rolling strategy on the qwen Deployment is maxSurge:0 / maxUnavailable:1
+  # (in-place pod swap to avoid requesting new GPU nodes). With 4 replicas,
+  # the roll terminates 1 pod at a time, waits for the replacement to come
+  # up Ready (~5-7 min including cache pull + vLLM init), then moves to the
+  # next. Total ~25-30 min for a full roll. Hence the 35-min rollout-status
+  # timeout below.
+  # ---------------------------------------------------------------------------
+  - name: gcr.io/cloud-builders/kubectl
+    id: deploy-prod
+    args:
+      - set
+      - image
+      - --namespace=riva
+      - deployment/qwen-asr-ws
+      - qwen-asr-ws=us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:$SHORT_SHA
+    env:
+      - CLOUDSDK_COMPUTE_REGION=us-central1
+      - CLOUDSDK_CONTAINER_CLUSTER=riva-cluster
+      - CLOUDSDK_CORE_PROJECT=sf-gke-9173
+    waitFor: [push-sha]
+
+  - name: gcr.io/cloud-builders/kubectl
+    id: rollout-status
+    args:
+      - rollout
+      - status
+      - --namespace=riva
+      - deployment/qwen-asr-ws
+      - --timeout=35m
+    env:
+      - CLOUDSDK_COMPUTE_REGION=us-central1
+      - CLOUDSDK_CONTAINER_CLUSTER=riva-cluster
+      - CLOUDSDK_CORE_PROJECT=sf-gke-9173
+    waitFor: [deploy-prod]
+
+images:
+  - us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:$SHORT_SHA
+  - us-central1-docker.pkg.dev/sf-infra-7d23/grpc-proxy/qwen-asr-ws:latest
+
+# vLLM image build is heavy (~5 GB devel base). Use a beefier machine to
+# cut build time vs the default E2_MEDIUM (which would OOM/timeout on
+# layered installs).
+timeout: 2400s
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8

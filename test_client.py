@@ -23,7 +23,8 @@ async def stream_file(uri: str, wav_path: str, language: str, chunk_ms: int = 10
 
     final_segments: list[str] = []
 
-    async with websockets.connect(uri, max_size=16 * 1024 * 1024, ssl=ssl_ctx) as ws:
+    ssl_arg = ssl_ctx if uri.startswith("wss://") else None
+    async with websockets.connect(uri, max_size=16 * 1024 * 1024, ssl=ssl_arg) as ws:
         await ws.send(json.dumps({
             "type": "config",
             "config": {"language": language, "sampleRate": sr},
